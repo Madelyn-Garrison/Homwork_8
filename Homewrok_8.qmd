@@ -1,0 +1,295 @@
+---
+title: "Homework 8"
+format: html
+editor: visual
+---
+
+## Reading Data
+
+```{r}
+#| include: false
+#| echo: false
+library(tidyverse)
+library(lubridate)
+library(tidymodels)
+```
+
+```{r}
+my_sample<-read_csv("SeoulBikeData.csv", locale = vroom::locale(encoding = "CP1252"))
+```
+
+## EDA
+
+First, we'll check the missingness of the data.
+
+```{r}
+colSums(is.na(my_sample))
+```
+
+No data is missing. Then we determine the column types and create summary statistics.
+
+```{r}
+str(my_sample)
+
+numeric<-my_sample[,c(-1, -12:-14)]
+
+categorical<-my_sample[,c(1, 12:14)]
+```
+
+For numeric variables:
+
+```{r}
+FUN = function(x) {
+  temp<- c(mean(x), median(x), sd(x), min(x), max(x))
+  names(temp)<- c("mean", "median", "sd", "min", "max")
+  temp
+}
+sapply(numeric, FUN)
+```
+
+For categorical variables:
+
+```{r}
+sapply(sapply(categorical, unique), length)
+```
+
+Convert the date variable into an actual date.
+
+```{r}
+my_sample<-my_sample|>
+  mutate(Date = dmy(Date))
+```
+
+`Seasons`, `Holiday`, and `Functioning Day` are converted to factors.
+
+```{r}
+my_sample<-my_sample|>
+  mutate(Seasons = as.factor(Seasons), Holiday = as.factor(Holiday), 
+         `Functioning Day` = as.factor(`Functioning Day`))
+```
+
+We'll also rename the variables to be more user-friendly.
+
+```{r}
+my_sample<- my_sample|>
+  rename('Rented_Bike_Count'=`Rented Bike Count`, "Temperature" = `Temperature(°C)`, 
+         "Rainfall"=`Rainfall(mm)`, "Snowfall" = `Snowfall (cm)`, "Humidity" = `Humidity(%)`, 
+         "Wind_speed" = `Wind speed (m/s)`,"Visability" = `Visibility (10m)`, 
+         "Dew_point_temperature" = `Dew point temperature(°C)`,"Solar_radiation" = `Solar Radiation (MJ/m2)`, 
+         "Functioning_Day" = `Functioning Day`)
+```
+
+Now we'll create some summary statistics.
+
+```{r}
+my_sample_summary<-my_sample|>
+  group_by(Seasons, Holiday, Functioning_Day)|>
+  summarize(across(where(is.numeric), list("mean" = mean, "sd" = sd, "min"=min, "max"=max),
+                   .names = "{.fn}_{.col}"))
+my_sample_summary
+```
+
+On the non-functioning days, no bikes are rented. Any 0 in `Rented_Bike_Count` for non-functioning days is not meaningful. We'll subset the `Functioning_Day` to only eaul "Yes".
+
+```{r}
+my_sample_functioning<- my_sample|>
+  filter(Functioning_Day == "Yes")
+```
+
+We'll summarize caross hours, so each day only has one observation. The data will be grouped by `Date`, `Seasons`, and `Holiday`. We'll find the average of all the numeric variables (so we'll know the average temperature on a particular, etc.) and we'll sum the total bikes, rain, and snow )so we'll know the total over a particular day).
+
+```{r}
+my_sample_final<-my_sample_functioning|>
+  group_by(Date, Seasons, Holiday)|>
+  summarize(sum_bikes = sum(Rented_Bike_Count), sum_rain = sum(Rainfall), sum_snow = sum(Snowfall),
+            across(where(is.numeric), list("mean" = mean),
+                   .names = "{.fn}_{.col}"))|>
+  select(-mean_Hour, -mean_sum_bikes, -mean_sum_rain, -mean_sum_snow, -mean_Rented_Bike_Count, -mean_Rainfall, -mean_Snowfall)
+my_sample_final
+```
+
+Now we'll create some new summary statistics, along with some visuals.
+
+```{r}
+numeric_final<-my_sample_final[,c(-1:-3)]
+
+categorical_final<-my_sample_final[,c(1:3)]
+
+sapply(numeric_final, FUN)
+
+sapply(sapply(categorical_final, unique), length)
+
+my_sample_final_summary<-my_sample_final|>
+  group_by(Seasons, Holiday)|>
+  summarize(across(where(is.numeric), list("mean" = mean),
+                   .names = "{.fn}_{.col}"))
+
+ggplot(my_sample_final_summary, aes(x=Seasons, y= mean_sum_bikes)) + 
+  geom_bar(stat = "identity") +
+  facet_wrap(~Holiday)
+
+ggplot(my_sample_final_summary, aes(x=mean_sum_rain, y= mean_sum_bikes, color=Seasons, shape = Holiday)) + 
+  geom_point()
+
+ggplot(my_sample_final_summary, aes(x=mean_mean_Wind_speed, y= mean_sum_bikes, color=Seasons, shape = Holiday)) + 
+  geom_point()
+
+ggplot(my_sample_final_summary, aes(x=mean_mean_Temperature, y= mean_sum_bikes, color=Seasons, shape = Holiday)) + 
+  geom_point()
+
+ggplot(my_sample_final_summary, aes(x=Seasons, y= mean_sum_rain)) + 
+  geom_bar(stat = "identity")
+
+ggplot(my_sample_final_summary, aes(x=Seasons, y= mean_sum_snow)) + 
+  geom_bar(stat = "identity")
+
+cor(numeric_final)
+```
+
+## Split the Data
+
+Next, we'll split the final data set into a training set and a testing set, with a 75/25 split, stratified by `Seasons`.
+
+```{r}
+set.seed(558)
+
+my_sample_split<-initial_split(my_sample_final, prop = 0.75, strata = Seasons)
+my_sample_train<-training(my_sample_split)
+my_sample_test<-testing(my_sample_split)
+```
+
+Add a 10 fold CV split on the training set. CV is an alternative to creating a testing/training set.
+
+```{r}
+get_cv_splits <- function(data, num_folds){
+  #get fold size
+  size_fold <- floor(nrow(data)/num_folds)
+  #get random indices to subset the data with
+  random_indices <- sample(1:nrow(data), size = nrow(data), replace = FALSE)
+  #create a list to save our folds in
+  folds <- list()
+  #now cycle through our random indices vector and take the appropriate observations to each fold
+  for(i in 1:num_folds){
+    if (i < num_folds) {
+      fold_index <- seq(from = (i-1)*size_fold +1, to = i*size_fold, by = 1)
+      folds[[i]] <- data[random_indices[fold_index], ]
+    } else {
+      fold_index <- seq(from = (i-1)*size_fold +1, to = length(random_indices), by = 1)
+      folds[[i]] <- data[random_indices[fold_index], ]
+    }
+  }
+  return(folds)
+}
+folds <- get_cv_splits(my_sample_train, 10)
+```
+
+## Fitting MLR Models
+
+We're going to create three different recipes for a linear model.
+
+The first recipe includes dummy variables of weekday/weekend, season, and holiday. All numeric variables are normalized. 
+
+```{r}
+r_1<-recipe(sum_bikes ~., data=my_sample_train)|>
+  step_date(Date, features=c("dow"))|>
+  step_mutate(Day =  factor(if_else(Date_dow == "Sat" | Date_dow == "Sun", 1, 2)))|>
+  step_rm(Date, Date_dow)|>
+  step_normalize(all_numeric(), -all_outcomes())|>
+  step_dummy(Seasons,Holiday, Day)
+```
+
+The second recipe adds interactions between seasons/holiday, seasons/temp, and temp/rainfall.
+
+```{r}
+r_2<-recipe(sum_bikes ~., data=my_sample_train)|>
+  step_date(Date, features=c("dow"))|>
+  step_mutate(Day =  factor(if_else(Date_dow == "Sat" | Date_dow == "Sun", 1, 2)))|>
+  step_rm(Date, Date_dow)|>
+  step_normalize(all_numeric(), -all_outcomes())|>
+  step_dummy(Seasons,Holiday, Day)|>
+  step_interact(terms= ~ Holiday_No.Holiday*starts_with("Seasons"))|>
+  step_interact(terms= ~ starts_with("Seasons")*mean_Temperature)|>
+  step_interact(terms= ~ sum_rain*mean_Temperature)
+```
+
+The third recipe adds a quadratic term for each numeric predictor.
+
+```{r}
+r_3<-recipe(sum_bikes ~., data=my_sample_train)|>
+  step_date(Date, features=c("dow"))|>
+  step_mutate(Day =  factor(if_else(Date_dow == "Sat" | Date_dow == "Sun", 1, 2)))|>
+  step_rm(Date, Date_dow)|>
+  step_normalize(all_numeric(), -all_outcomes())|>
+  step_dummy(Seasons, Holiday, Day)|>
+  step_interact(terms= ~ Holiday_No.Holiday*starts_with("Seasons"))|>
+  step_interact(terms= ~ starts_with("Seasons")*mean_Temperature)|>
+  step_interact(terms= ~ sum_rain*mean_Temperature)|>
+  step_mutate(sum_rain^2, sum_snow^2, mean_Temperature^2, mean_Humidity^2, mean_Wind_speed^2, mean_Visability^2, mean_Dew_point_temperature^2, mean_Solar_radiation^2)
+```
+
+Test the models:
+
+```{r}
+my_sample_model<-linear_reg() %>%
+  set_engine("lm")
+
+my_sample_r1_wfl <- workflow() |>
+  add_recipe(r_1) |>
+  add_model(my_sample_model)
+
+first_model<- my_sample_r1_wfl|>
+  fit(my_sample_train)
+first_model|>
+  tidy()
+
+my_sample_10_fold <- vfold_cv(my_sample_train, 10)
+
+my_sample_CV_fits <- my_sample_r1_wfl |>
+  fit_resamples(my_sample_10_fold)
+
+my_sample_r2_wfl <- workflow() |>
+  add_recipe(r_2) |>
+  add_model(my_sample_model)
+
+second_model<- my_sample_r2_wfl|>
+  fit(my_sample_train)
+second_model|>
+  tidy()
+
+my_sample_CV_fits_2 <- my_sample_r2_wfl |>
+  fit_resamples(my_sample_10_fold)
+
+my_sample_r3_wfl <- workflow() |>
+  add_recipe(r_3) |>
+  add_model(my_sample_model)
+
+third_model<- my_sample_r3_wfl|>
+  fit(my_sample_train)
+
+third_model|>
+  tidy()
+
+my_sample_CV_fits_3 <- my_sample_r3_wfl |>
+  fit_resamples(my_sample_10_fold)
+
+rbind(my_sample_CV_fits_3 |>
+  collect_metrics(), my_sample_CV_fits_2 |>
+  collect_metrics(), my_sample_CV_fits |>
+    collect_metrics())
+
+```
+
+Based on RMSE, the third model is the best.
+
+```{r}
+#| error: true
+third_model|>
+  last_fit(my_sample_split)|>
+  collect_metrics()
+```
+
+```{r}
+final_model<- third_model|>
+    extract_fit_parsnip()|>
+  tidy()
+```
